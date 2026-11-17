@@ -1,63 +1,155 @@
 import os
+import sys
+import time
 import torch
 from PIL import Image
 from transformers import CLIPProcessor, CLIPModel
 from qdrant_client import QdrantClient
 from qdrant_client.models import VectorParams, Distance, PointStruct
 
-# 1. Hardware Config (Apple Silicon MPS)
-if torch.backends.mps.is_available() and torch.backends.mps.is_built():
-    device = torch.device("mps")
-else:
-    device = torch.device("cpu")
+# ──────────────────────────────────────────────
+# Configuration
+# ──────────────────────────────────────────────
+MODEL_NAME = "openai/clip-vit-base-patch32"
+EMBEDDING_DIM = 512
+COLLECTION_NAME = "autonomous_driving_data"
+QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
+QDRANT_PORT = int(os.getenv("QDRANT_PORT", 6333))
+IMAGE_DIR = os.getenv("IMAGE_DIR", "data")
+SUPPORTED_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tiff')
+BATCH_SIZE = 16  # Process images in batches for efficiency
 
-# 2. Load CLIP Model and Processor
-model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
-processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 
-# 3. Connect to Qdrant
-client = QdrantClient("localhost", port=6333)
-collection_name = "autonomous_driving_data"
+def get_device() -> torch.device:
+    """Select the best available hardware accelerator."""
+    if torch.backends.mps.is_available() and torch.backends.mps.is_built():
+        return torch.device("mps")
+    elif torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
 
-if not client.collection_exists(collection_name):
+
+def load_model(device: torch.device):
+    """Load the CLIP model and processor."""
+    print(f"⏳ Loading CLIP model '{MODEL_NAME}'...")
+    model = CLIPModel.from_pretrained(MODEL_NAME).to(device)
+    processor = CLIPProcessor.from_pretrained(MODEL_NAME)
+    model.eval()
+    print(f"✅ Model loaded on {device}")
+    return model, processor
+
+
+def discover_images(image_dir: str) -> list[str]:
+    """Recursively discover all supported image files."""
+    images = []
+    for root, _, files in os.walk(image_dir):
+        for f in sorted(files):
+            if f.lower().endswith(SUPPORTED_EXTENSIONS):
+                images.append(os.path.join(root, f))
+    return images
+
+
+def generate_embeddings(
+    image_paths: list[str],
+    model: CLIPModel,
+    processor: CLIPProcessor,
+    device: torch.device,
+) -> list[PointStruct]:
+    """Generate CLIP embeddings for a list of images in batches."""
+    points = []
+    total = len(image_paths)
+
+    for batch_start in range(0, total, BATCH_SIZE):
+        batch_paths = image_paths[batch_start : batch_start + BATCH_SIZE]
+        batch_images = []
+        batch_names = []
+
+        for path in batch_paths:
+            try:
+                img = Image.open(path).convert("RGB")
+                batch_images.append(img)
+                # Store relative path from IMAGE_DIR for portability
+                batch_names.append(os.path.relpath(path, IMAGE_DIR))
+            except Exception as e:
+                print(f"  ⚠️  Skipping {path}: {e}")
+                continue
+
+        if not batch_images:
+            continue
+
+        # Process the whole batch at once
+        inputs = processor(images=batch_images, return_tensors="pt", padding=True).to(device)
+
+        with torch.no_grad():
+            image_features = model.get_image_features(**inputs)
+
+        # Handle Transformers ≥5.x output format
+        if not isinstance(image_features, torch.Tensor):
+            image_features = getattr(
+                image_features, "image_embeds",
+                getattr(image_features, "pooler_output", image_features),
+            )
+
+        # L2 normalize for cosine similarity
+        image_features = image_features / image_features.norm(p=2, dim=-1, keepdim=True)
+        embeddings = image_features.cpu().numpy()
+
+        for i, name in enumerate(batch_names):
+            idx = batch_start + i
+            points.append(
+                PointStruct(
+                    id=idx,
+                    vector=embeddings[i].tolist(),
+                    payload={"filename": name},
+                )
+            )
+
+        processed = min(batch_start + len(batch_paths), total)
+        print(f"  📸 Processed {processed}/{total} images")
+
+    return points
+
+
+def main():
+    device = get_device()
+    model, processor = load_model(device)
+
+    # Connect to Qdrant
+    print(f"🔗 Connecting to Qdrant at {QDRANT_HOST}:{QDRANT_PORT}...")
+    client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
+
+    # Recreate collection (clean start each run)
+    if client.collection_exists(COLLECTION_NAME):
+        client.delete_collection(COLLECTION_NAME)
     client.create_collection(
-        collection_name=collection_name,
-        vectors_config=VectorParams(size=512, distance=Distance.COSINE),
+        collection_name=COLLECTION_NAME,
+        vectors_config=VectorParams(size=EMBEDDING_DIM, distance=Distance.COSINE),
     )
+    print(f"✅ Collection '{COLLECTION_NAME}' created")
 
-# 4. Generate Embeddings for Images
-image_dir = "data"
-os.makedirs(image_dir, exist_ok=True)
-images = [f for f in os.listdir(image_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+    # Discover images
+    os.makedirs(IMAGE_DIR, exist_ok=True)
+    image_paths = discover_images(IMAGE_DIR)
 
-points = []
-for idx, image_name in enumerate(images):
-    image_path = os.path.join(image_dir, image_name)
-    image = Image.open(image_path).convert("RGB")
-    
-    # Process image through CLIP
-    inputs = processor(images=image, return_tensors="pt").to(device)
-    
-    with torch.no_grad():
-        image_features = model.get_image_features(**inputs)
-    
-    # FIX: Handle different Transformers output formats
-    if not isinstance(image_features, torch.Tensor):
-        image_features = getattr(image_features, "image_embeds", getattr(image_features, "pooler_output", image_features))
-    
-    # Convert tensor to a flat Python list
-    embedding = image_features.cpu().numpy()[0].tolist()
-    
-    # Create Qdrant Point
-    points.append(PointStruct(
-        id=idx,
-        vector=embedding,
-        payload={"filename": image_name}
-    ))
+    if not image_paths:
+        print(f"\n❌ No images found in '{IMAGE_DIR}/'. Add images and re-run.")
+        sys.exit(1)
 
-# 5. Upload to Database
-if points:
-    client.upsert(collection_name=collection_name, points=points)
-    print(f"Successfully indexed {len(points)} images!")
-else:
-    print("No images found in the 'data/' folder. Please add some.")
+    print(f"🔍 Found {len(image_paths)} images in '{IMAGE_DIR}/'")
+
+    # Generate embeddings and upload
+    start = time.time()
+    points = generate_embeddings(image_paths, model, processor, device)
+    elapsed = time.time() - start
+
+    if points:
+        client.upsert(collection_name=COLLECTION_NAME, points=points)
+        print(f"\n🎉 Successfully indexed {len(points)} images in {elapsed:.1f}s")
+        print(f"   Average: {elapsed / len(points):.2f}s per image")
+    else:
+        print("\n❌ No images could be processed.")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

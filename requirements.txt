@@ -1,0 +1,8 @@
+torch
+transformers
+qdrant-client
+fastapi
+uvicorn[standard]
+streamlit
+Pillow
+requests
